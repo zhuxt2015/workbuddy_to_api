@@ -16,6 +16,7 @@
 - SSE 流式输出
 - WorkBuddy 工具调用、工具结果、阶段与用量事件
 - 后台启动、状态查看和停止
+- WorkBuddy 风格本地管理面板：签到、账户额度、模型实时倍率和代理消耗账本
 
 ## 运行要求
 
@@ -183,6 +184,31 @@ python .\workbuddy_to_api.py `
 - `workbuddy.interruption`
 - `workbuddy.session_end`
 
+## 本地管理面板
+
+打开 `http://127.0.0.1:3000/admin`，输入代理 API Key 后可使用以下功能：
+
+- **每日签到**：显示 WorkBuddy 签到状态、连续签到、活动奖励和周进度；只有点击“立即签到”时才会发送签到请求。
+- **积分 / 额度余额**：读取 WorkBuddy 账户资源中的可用、已用、总额度和周期信息。
+- **模型实时倍率**：显示本地 WorkBuddy 模型目录中每个模型的 `credits` 倍率及工具、图像、推理能力。
+- **模型消耗记录**：显示本代理成功请求的模型、兼容协议、输入 / 输出 / 总 token 和统计来源，并提供按模型累计排行。
+- **MCP 管理**：继续提供服务状态、工具列表、重新载入与连通性测试。
+
+管理页和全部 `/admin/*` 数据接口只接受本机回环地址请求，并沿用 `PROXY_API_KEY`。账户会话、访问令牌、用户标识、请求 ID、提示词、回答内容和 MCP 参数都不会写入消耗账本、运行时状态或管理页响应。
+
+### 管理面板接口
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| `GET` | `/admin/dashboard` | 管理页总览：服务、签到、账户资源和用量摘要 |
+| `GET` | `/admin/checkin` | 查询签到状态 |
+| `POST` | `/admin/checkin/claim` | 显式执行今日签到 |
+| `GET` | `/admin/account` | 查询脱敏后的账户额度资源 |
+| `GET` | `/admin/usage?limit=100` | 查询本地模型消耗账本 |
+| `GET` | `/admin/models/rates` | 查询模型实时倍率与能力 |
+
+`runtime/usage-ledger.json` 是本机用量账本，默认最多保留 1000 条。它只包含时间、模型 ID、协议、token 数、统计是否为估算值和成功状态；`runtime/` 已由 `.gitignore` 排除。
+
 ## MCP
 
 默认配置发现顺序：
@@ -228,6 +254,9 @@ Copy-Item .env.example .env
 | `WORKBUDDY_MAX_TURNS` | `8` | 最大 agent 回合数 |
 | `WORKBUDDY_MCP_CONFIG` | 自动发现 | MCP JSON 或配置文件路径 |
 | `WORKBUDDY_EVENT_MAX_BYTES` | `65536` | 单个事件字段大小上限 |
+| `WORKBUDDY_ACCOUNT_SESSION_PATH` | 自动发现 | WorkBuddy 本地会话文件路径，仅在内存中读取 |
+| `WORKBUDDY_ACCOUNT_TIMEOUT_MS` | `15000` | 账户、签到请求超时（毫秒） |
+| `WORKBUDDY_USAGE_LEDGER_MAX_RECORDS` | `1000` | 本机模型消耗账本最大记录数 |
 
 完整配置见 `.env.example`。
 
@@ -282,7 +311,7 @@ Get-Content .\runtime\gateway-auto-agent.err.log -Tail 100
 ```text
 workbuddy_to_api/
 ├─ workbuddy_to_api.py       # Python 主程序与命令行入口
-├─ admin.html                # MCP 管理页
+├─ admin.html                # WorkBuddy 风格管理页（签到、额度、倍率、用量、MCP）
 ├─ pyproject.toml            # Python 项目元数据
 ├─ .env.example              # 配置示例
 ├─ mcp-example.json          # MCP 测试配置

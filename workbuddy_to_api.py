@@ -460,6 +460,10 @@ class Config:
     api_key: str
     workbuddy_exe: Path
     cli_script: Path
+    product_config: Path
+    account_session_path: Path
+    account_timeout_ms: int
+    usage_ledger_max_records: int
     cwd: Path
     default_model: str
     models: list[str]
@@ -499,6 +503,10 @@ class Config:
         default_cli = unpacked_cli if unpacked_cli.exists() else packed_cli
         workbuddy_exe = Path(args.workbuddy_exe or os.getenv("WORKBUDDY_EXE") or default_exe).expanduser().resolve()
         cli_script = Path(args.cli_script or os.getenv("WORKBUDDY_CLI_SCRIPT") or default_cli).expanduser().resolve()
+        default_product_config = cli_script.parent.parent / "product.json"
+        product_config = Path(os.getenv("WORKBUDDY_PRODUCT_CONFIG") or default_product_config).expanduser().resolve()
+        default_account_session = local / "CodeBuddyExtension" / "Data" / "Public" / "auth" / "workbuddy-desktop.info"
+        account_session_path = Path(os.getenv("WORKBUDDY_ACCOUNT_SESSION_PATH") or default_account_session).expanduser().resolve()
         catalog = load_model_catalog(cli_script, Path.home())
         configured = split_csv(os.getenv("WORKBUDDY_MODELS"), [])
         ids = configured or [x["id"] for x in catalog["models"]]
@@ -512,7 +520,10 @@ class Config:
             host=args.host or os.getenv("PROXY_HOST") or "127.0.0.1",
             port=args.port or env_int("PROXY_PORT", 3000),
             api_key=args.api_key if args.api_key is not None else os.getenv("PROXY_API_KEY", ""),
-            workbuddy_exe=workbuddy_exe, cli_script=cli_script,
+            workbuddy_exe=workbuddy_exe, cli_script=cli_script, product_config=product_config,
+            account_session_path=account_session_path,
+            account_timeout_ms=env_int("WORKBUDDY_ACCOUNT_TIMEOUT_MS", 15000),
+            usage_ledger_max_records=env_int("WORKBUDDY_USAGE_LEDGER_MAX_RECORDS", 1000),
             cwd=Path(args.cwd or os.getenv("WORKBUDDY_CWD") or Path.cwd()).expanduser().resolve(),
             default_model=default_model, models=list(dict.fromkeys(ids)),
             model_catalog={x["id"]: x for x in catalog["models"]},
@@ -561,6 +572,287 @@ class Config:
         if model not in self.models:
             raise ProxyError(400, "model_not_found", f"Model '{raw}' is not configured. Available models: {', '.join(self.models)}")
         return model
+
+
+class UsageLedger:
+    """Small local-only usage ledger that never stores request or response content."""
+
+    def __init__(self, filename: Path, max_records: int):
+        self.filename = filename
+        self.max_records = max(100, min(int(max_records), 100000))
+        self.lock = threading.RLock()
+        self.filename.parent.mkdir(parents=True, exist_ok=True)
+        self.records = self._load()
+
+    def _load(self) -> list[dict[str, Any]]:
+        parsed = read_json_file(self.filename)
+        raw = parsed.get("records") if isinstance(parsed, dict) else parsed
+        if not isinstance(raw, list):
+            return []
+        records: list[dict[str, Any]] = []
+        for item in raw[-self.max_records:]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                record = {
+                    "timestamp": str(item.get("timestamp") or ""),
+                    "model": slug(str(item.get("model") or "auto")),
+                    "protocol": str(item.get("protocol") or "chat")[:24],
+                    "input_tokens": max(0, int(item.get("input_tokens") or 0)),
+                    "output_tokens": max(0, int(item.get("output_tokens") or 0)),
+                    "total_tokens": max(0, int(item.get("total_tokens") or 0)),
+                    "estimated": bool(item.get("estimated")),
+                    "success": bool(item.get("success", True)),
+                }
+            except (TypeError, ValueError):
+                continue
+            records.append(record)
+        return records
+
+    def _save_locked(self) -> None:
+        payload = {"version": 1, "records": self.records[-self.max_records:]}
+        temporary = self.filename.with_suffix(self.filename.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        temporary.replace(self.filename)
+
+    def append(self, model: str, protocol: str, usage: Any, estimated: bool) -> None:
+        if not isinstance(usage, dict):
+            return
+        try:
+            input_tokens = max(0, int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0))
+            output_tokens = max(0, int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0))
+            total_tokens = max(0, int(usage.get("total_tokens") or input_tokens + output_tokens))
+        except (TypeError, ValueError):
+            return
+        record = {
+            "timestamp": now_iso(),
+            "model": slug(model),
+            "protocol": str(protocol or "chat")[:24],
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "estimated": bool(estimated),
+            "success": True,
+        }
+        with self.lock:
+            self.records.append(record)
+            if len(self.records) > self.max_records:
+                self.records = self.records[-self.max_records:]
+            with contextlib.suppress(Exception):
+                self._save_locked()
+
+    @staticmethod
+    def _is_today(timestamp: str) -> bool:
+        try:
+            value = _dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            return value.astimezone().date() == _dt.datetime.now().astimezone().date()
+        except Exception:
+            return False
+
+    def snapshot(self, limit: int = 100) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 500))
+        with self.lock:
+            values = list(self.records)
+        today = [item for item in values if self._is_today(str(item.get("timestamp") or ""))]
+        totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        ranking: dict[str, dict[str, Any]] = {}
+        for item in values:
+            for key in totals:
+                totals[key] += int(item.get(key) or 0)
+            model = str(item.get("model") or "auto")
+            bucket = ranking.setdefault(model, {"model": model, "requests": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+            bucket["requests"] += 1
+            for key in totals:
+                bucket[key] += int(item.get(key) or 0)
+        today_totals = {key: sum(int(item.get(key) or 0) for item in today) for key in totals}
+        return {
+            "updated_at": now_iso(),
+            "summary": {
+                "total_requests": len(values),
+                "today_requests": len(today),
+                "input_tokens": totals["input_tokens"],
+                "output_tokens": totals["output_tokens"],
+                "total_tokens": totals["total_tokens"],
+                "today_input_tokens": today_totals["input_tokens"],
+                "today_output_tokens": today_totals["output_tokens"],
+                "today_total_tokens": today_totals["total_tokens"],
+            },
+            "ranking": sorted(ranking.values(), key=lambda item: (item["total_tokens"], item["requests"]), reverse=True)[:12],
+            "records": list(reversed(values[-limit:])),
+        }
+
+
+class WorkBuddyAccountClient:
+    """Reads the local WorkBuddy session in memory and returns a redacted account view."""
+
+    def __init__(self, config: Config):
+        self.config = config
+
+    @staticmethod
+    def _number(value: Any) -> int | float | None:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, str):
+            candidate = value.strip()
+            if re.fullmatch(r"-?\d+(?:\.\d+)?", candidate):
+                try:
+                    return int(candidate) if "." not in candidate else float(candidate)
+                except ValueError:
+                    return None
+        return None
+
+    @staticmethod
+    def _text(value: Any, maximum: int = 160) -> str:
+        return str(value or "").strip()[:maximum]
+
+    def available(self) -> bool:
+        return self.config.product_config.is_file() and self.config.account_session_path.is_file()
+
+    def _session(self) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        session = read_json_file(self.config.account_session_path)
+        if not isinstance(session, dict):
+            raise ProxyError(503, "workbuddy_account_unavailable", "未检测到 WorkBuddy 本地登录会话。")
+        auth = session.get("auth") if isinstance(session.get("auth"), dict) else {}
+        account = session.get("account") if isinstance(session.get("account"), dict) else {}
+        token = auth.get("accessToken")
+        user_id = account.get("uid") or account.get("uin") or account.get("oneidAccountId")
+        if not isinstance(token, str) or not token.strip() or user_id is None or not str(user_id).strip():
+            raise ProxyError(503, "workbuddy_account_session_expired", "WorkBuddy 本地会话已失效，请先在客户端完成登录。")
+        product = read_json_file(self.config.product_config)
+        if not isinstance(product, dict):
+            raise ProxyError(503, "workbuddy_product_config_missing", "未找到 WorkBuddy 产品配置。")
+        return auth, account, product
+
+    def _post(self, route: str) -> dict[str, Any]:
+        auth, account, product = self._session()
+        endpoint = self._text(product.get("endpoint")) or "https://copilot.tencent.com"
+        if not endpoint.startswith(("http://", "https://")):
+            endpoint = "https://" + endpoint
+        endpoint = endpoint.rstrip("/") + route
+        version = self._text(product.get("genieVersion"), 32) or "5.3.5"
+        headers = {
+            "Authorization": "Bearer " + str(auth["accessToken"]),
+            "X-User-Id": str(account.get("uid") or account.get("uin") or account.get("oneidAccountId")),
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "WorkBuddy/" + version,
+            "X-IDE-Type": "WorkBuddy",
+            "X-IDE-Name": "WorkBuddy",
+            "X-IDE-Version": version,
+            "X-Product": "WorkBuddy",
+        }
+        domain = auth.get("domain")
+        if isinstance(domain, str) and domain.strip():
+            headers["X-Domain"] = domain.strip()
+        enterprise_id = account.get("enterpriseId") or account.get("enterprise_id")
+        if enterprise_id is not None and str(enterprise_id).strip():
+            headers["X-Enterprise-Id"] = str(enterprise_id)
+            headers["X-Tenant-Id"] = str(enterprise_id)
+        request = urllib.request.Request(endpoint, data=b"{}", method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=self.config.account_timeout_ms / 1000) as response:
+                parsed = json.loads(response.read().decode("utf-8-sig"))
+        except urllib.error.HTTPError as exc:
+            with contextlib.suppress(Exception):
+                exc.close()
+            if exc.code in {401, 403}:
+                raise ProxyError(503, "workbuddy_account_session_expired", "WorkBuddy 本地会话已失效，请先在客户端重新登录。") from exc
+            raise ProxyError(502, "workbuddy_account_upstream_error", f"WorkBuddy 账户服务返回 HTTP {exc.code}。") from exc
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+            raise ProxyError(502, "workbuddy_account_connect_error", "WorkBuddy 账户服务暂时不可达，请检查网络或系统代理。") from exc
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProxyError(502, "workbuddy_account_invalid_response", "WorkBuddy 账户服务返回了无法识别的数据。") from exc
+        if not isinstance(parsed, dict):
+            raise ProxyError(502, "workbuddy_account_invalid_response", "WorkBuddy 账户服务返回了无法识别的数据。")
+        code = parsed.get("code")
+        if code not in {None, 0, "0"}:
+            raise ProxyError(502, "workbuddy_account_request_failed", "WorkBuddy 账户服务未完成本次请求。")
+        return parsed
+
+    @staticmethod
+    def _data(payload: dict[str, Any]) -> dict[str, Any]:
+        value = payload.get("data")
+        return value if isinstance(value, dict) else {}
+
+    def checkin(self) -> dict[str, Any]:
+        data = self._data(self._post("/v2/billing/meter/checkin-activity-status"))
+        progress = data.get("week_progress")
+        return {
+            "available": True,
+            "active": bool(data.get("active")),
+            "today_checked_in": bool(data.get("today_checked_in")),
+            "streak_days": int(self._number(data.get("streak_days")) or 0),
+            "daily_credit": self._number(data.get("daily_credit")) or 0,
+            "today_credit": self._number(data.get("today_credit")) or 0,
+            "total_credits": self._number(data.get("total_credits")) or 0,
+            "is_streak_day": bool(data.get("is_streak_day")),
+            "next_streak_day": int(self._number(data.get("next_streak_day")) or 0),
+            "streak_bonus_days": data.get("streak_bonus_days") if isinstance(data.get("streak_bonus_days"), list) else [],
+            "streak_bonus_credit": self._number(data.get("streak_bonus_credit")) or 0,
+            "checkin_dates": [self._text(item, 24) for item in data.get("checkin_dates", []) if isinstance(item, str)][:31],
+            "week_progress": [bool(item) for item in progress][:7] if isinstance(progress, list) else [],
+            "activity_name": self._text(data.get("activity_name")),
+            "theme_name": self._text(data.get("theme_name")),
+            "season": self._text(data.get("season"), 40),
+            "start_time": self._text(data.get("start_time"), 40),
+            "end_time": self._text(data.get("end_time"), 40),
+            "claim_button_text": self._text(data.get("claim_button_text"), 80),
+        }
+
+    def claim_checkin(self) -> dict[str, Any]:
+        self._post("/v2/billing/meter/daily-checkin")
+        status = self.checkin()
+        return {"status": "ok", "claimed": bool(status.get("today_checked_in")), "checkin": status}
+
+    def account(self) -> dict[str, Any]:
+        payload = self._data(self._post("/v2/billing/meter/get-user-resource"))
+        response = payload.get("Response") if isinstance(payload.get("Response"), dict) else {}
+        data = response.get("Data") if isinstance(response.get("Data"), dict) else {}
+        raw_resources = data.get("Accounts") if isinstance(data.get("Accounts"), list) else []
+        resources: list[dict[str, Any]] = []
+        for item in raw_resources[:100]:
+            if not isinstance(item, dict):
+                continue
+            total = self._number(item.get("CapacitySizePrecise"))
+            remaining = self._number(item.get("CapacityRemainPrecise"))
+            used = self._number(item.get("CapacityUsedPrecise"))
+            total = self._number(item.get("CapacitySize")) if total is None else total
+            remaining = self._number(item.get("CapacityRemain")) if remaining is None else remaining
+            used = self._number(item.get("CapacityUsed")) if used is None else used
+            resources.append({
+                "name": self._text(item.get("PackageName") or item.get("ProductName") or item.get("DealName"), 120),
+                "product": self._text(item.get("ProductName") or item.get("SubProductName"), 120),
+                "unit": self._text(item.get("CapacityUnit") or item.get("OriginUnit"), 32),
+                "total": total,
+                "remaining": remaining,
+                "used": used,
+                "cycle_total": self._number(item.get("CycleCapacitySizePrecise")) if self._number(item.get("CycleCapacitySizePrecise")) is not None else self._number(item.get("CycleCapacitySize")),
+                "cycle_remaining": self._number(item.get("CycleCapacityRemainPrecise")) if self._number(item.get("CycleCapacityRemainPrecise")) is not None else self._number(item.get("CycleCapacityRemain")),
+                "cycle_used": self._number(item.get("CycleCapacityUsedPrecise")) if self._number(item.get("CycleCapacityUsedPrecise")) is not None else self._number(item.get("CycleCapacityUsed")),
+                "cycle_start": self._text(item.get("CycleStartTime"), 40),
+                "cycle_end": self._text(item.get("CycleEndTime") or item.get("ExpiredTime"), 40),
+                "status": int(self._number(item.get("Status")) or 0),
+            })
+        balances: dict[str, dict[str, Any]] = {}
+        for resource in resources:
+            unit = resource["unit"] or "额度"
+            bucket = balances.setdefault(unit, {"unit": unit, "remaining": 0, "used": 0, "total": 0, "resources": 0})
+            bucket["resources"] += 1
+            for key in ("remaining", "used", "total"):
+                value = resource.get(key)
+                if isinstance(value, (int, float)):
+                    bucket[key] += value
+        primary = max(resources, key=lambda item: float(item.get("remaining") or 0), default=None)
+        return {
+            "available": True,
+            "updated_at": now_iso(),
+            "resource_count": len(resources),
+            "primary_balance": primary,
+            "balances": list(balances.values()),
+            "resources": resources,
+        }
 
 
 def parse_mcp_config(value: str) -> dict[str, Any]:
@@ -1285,7 +1577,52 @@ class ProxyApplication:
         self.config = config; self.gateways = GatewayManager(config); self.started_at = time.time()
         self.mcp_admin = McpAdminManager(config.mcp_config, config.mcp_config_source, config.mcp_server_sources,
                                          config.mcp_admin_timeout_ms, config.mcp_admin_cache_ms)
+        self.usage_ledger = UsageLedger(RUNTIME_DIR / "usage-ledger.json", config.usage_ledger_max_records)
+        self.account_client = WorkBuddyAccountClient(config)
         self.mcp_lock = threading.RLock(); self.last_mcp_refresh_ms = 0.0; self.server: Optional[ThreadingHTTPServer] = None
+
+    def record_usage(self, model: str, protocol: str, usage: Any, source_usage: Any) -> None:
+        self.usage_ledger.append(model, protocol, usage, not isinstance(source_usage, dict))
+
+    def model_rates(self) -> dict[str, Any]:
+        self.config.refresh_catalog(False)
+        data: list[dict[str, Any]] = []
+        for model_id in self.config.models:
+            item = self.config.model_catalog.get(model_id, {})
+            data.append({
+                "id": model_id,
+                "name": item.get("name", model_id),
+                "vendor": item.get("vendor"),
+                "type": item.get("type", "chat"),
+                "credits": item.get("credits"),
+                "supports_tool_call": bool(item.get("supportsToolCall")),
+                "supports_images": bool(item.get("supportsImages")),
+                "supports_reasoning": bool(item.get("supportsReasoning")),
+                "max_input_tokens": item.get("maxInputTokens"),
+                "max_output_tokens": item.get("maxOutputTokens"),
+            })
+        return {"object": "list", "source": self.config.model_catalog_source,
+                "updated_at": self.config.model_catalog_updated_at, "data": data}
+
+    def dashboard(self) -> dict[str, Any]:
+        def account_snapshot(loader: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+            try:
+                return loader()
+            except ProxyError as exc:
+                return {"available": False, "error": str(exc)}
+        self.config.refresh_catalog(False)
+        usage = self.usage_ledger.snapshot(100)
+        return {
+            "generated_at": now_iso(),
+            "service": {
+                "status": "ok", "uptime_seconds": round(time.time() - self.started_at, 3),
+                "model_count": len(self.config.models), "default_model": self.config.default_model,
+                "model_catalog_source": self.config.model_catalog_source,
+            },
+            "checkin": account_snapshot(self.account_client.checkin),
+            "account": account_snapshot(self.account_client.account),
+            "usage": usage,
+        }
 
     def refresh_mcp(self, force: bool = False, restart: bool = True) -> dict[str, Any]:
         with self.mcp_lock:
@@ -1419,15 +1756,28 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.check_auth(); self.app.config.refresh_catalog(False)
             created = int(time.time()); data = []
             for model_id in self.app.config.models:
-                item = self.app.config.model_catalog.get(model_id, {}); data.append({"id": model_id, "object": "model", "created": created, "owned_by": "workbuddy", "name": item.get("name", model_id), "vendor": item.get("vendor"), "type": item.get("type", "chat"), "supports_tool_call": item.get("supportsToolCall", False), "supports_images": item.get("supportsImages", False), "supports_reasoning": item.get("supportsReasoning", False), "max_input_tokens": item.get("maxInputTokens"), "max_output_tokens": item.get("maxOutputTokens")})
+                item = self.app.config.model_catalog.get(model_id, {}); data.append({"id": model_id, "object": "model", "created": created, "owned_by": "workbuddy", "name": item.get("name", model_id), "vendor": item.get("vendor"), "type": item.get("type", "chat"), "supports_tool_call": item.get("supportsToolCall", False), "supports_images": item.get("supportsImages", False), "supports_reasoning": item.get("supportsReasoning", False), "credits": item.get("credits"), "max_input_tokens": item.get("maxInputTokens"), "max_output_tokens": item.get("maxOutputTokens")})
             self.send_json(200, {"object": "list", "data": data, "has_more": False, "first_id": data[0]["id"] if data else None, "last_id": data[-1]["id"] if data else None, "source": self.app.config.model_catalog_source, "updated_at": self.app.config.model_catalog_updated_at}); return
         if path.startswith("/v1/models/"):
             self.check_auth(); model_id = self.app.config.resolve_model(urllib.parse.unquote(path[len("/v1/models/"):]))
-            item = self.app.config.model_catalog.get(model_id, {}); self.send_json(200, {"id": model_id, "object": "model", "created": int(time.time()), "owned_by": "workbuddy", "name": item.get("name", model_id), "vendor": item.get("vendor"), "type": item.get("type", "chat"), "supports_tool_call": item.get("supportsToolCall", False), "supports_images": item.get("supportsImages", False), "supports_reasoning": item.get("supportsReasoning", False), "max_input_tokens": item.get("maxInputTokens"), "max_output_tokens": item.get("maxOutputTokens")}); return
+            item = self.app.config.model_catalog.get(model_id, {}); self.send_json(200, {"id": model_id, "object": "model", "created": int(time.time()), "owned_by": "workbuddy", "name": item.get("name", model_id), "vendor": item.get("vendor"), "type": item.get("type", "chat"), "supports_tool_call": item.get("supportsToolCall", False), "supports_images": item.get("supportsImages", False), "supports_reasoning": item.get("supportsReasoning", False), "credits": item.get("credits"), "max_input_tokens": item.get("maxInputTokens"), "max_output_tokens": item.get("maxOutputTokens")}); return
         if path == "/admin":
             self.check_admin(); html_file = ROOT / "admin.html"
             html = html_file.read_text(encoding="utf-8") if html_file.exists() else "<!doctype html><meta charset=utf-8><title>workbuddy_to_api</title><h1>workbuddy_to_api</h1><p>Use /admin/mcp/servers and /admin/mcp/tools.</p>"
             self.send_html(200, html); return
+        if path == "/admin/dashboard":
+            self.check_admin(); self.check_auth(); self.send_json(200, self.app.dashboard()); return
+        if path == "/admin/account":
+            self.check_admin(); self.check_auth(); self.send_json(200, self.app.account_client.account()); return
+        if path == "/admin/checkin":
+            self.check_admin(); self.check_auth(); self.send_json(200, self.app.account_client.checkin()); return
+        if path == "/admin/usage":
+            self.check_admin(); self.check_auth(); query = urllib.parse.parse_qs(parsed.query)
+            try: limit = int((query.get("limit") or ["100"])[0])
+            except (TypeError, ValueError): limit = 100
+            self.send_json(200, self.app.usage_ledger.snapshot(limit)); return
+        if path == "/admin/models/rates":
+            self.check_admin(); self.check_auth(); self.send_json(200, self.app.model_rates()); return
         if path == "/admin/mcp/servers":
             self.check_admin(); self.check_auth(); self.app.refresh_mcp(False, False)
             self.send_json(200, {"object": "list", "summary": self.app.mcp_admin.summary(), "data": self.app.mcp_admin.list_servers()}); return
@@ -1445,6 +1795,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"status": "ok", "changed": result["changed"], "restarted_gateways": result["restartedGateways"], "summary": self.app.mcp_admin.summary(), "servers": self.app.mcp_admin.list_servers()}); return
         if path == "/admin/mcp/test":
             self.check_admin(); self.check_auth(); self.app.refresh_mcp(False, False); self.send_json(200, self.app.mcp_admin.test(self.read_json())); return
+        if path == "/admin/checkin/claim":
+            self.check_admin(); self.check_auth(); self.read_json(); self.send_json(200, self.app.account_client.claim_checkin()); return
         if path == "/admin/shutdown":
             self.check_admin(); self.check_auth(); self.read_json(); self.send_json(200, {"status": "stopping", "pid": os.getpid()})
             threading.Thread(target=self.app.shutdown, daemon=True).start(); return
@@ -1486,8 +1838,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                     if output: self.write_sse({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {"content": output}, "logprobs": None, "finish_reason": None}]})
             self.write_sse({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
                             "choices": [{"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish}]})
+            usage = openai_usage(base_prompt, output, generation.get("usage"))
             if isinstance(body.get("stream_options"), dict) and body["stream_options"].get("include_usage"):
-                self.write_sse({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [], "usage": openai_usage(base_prompt, output, generation.get("usage"))})
+                self.write_sse({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [], "usage": usage})
+            self.app.record_usage(model, "chat", usage, generation.get("usage"))
             self.write_sse("[DONE]"); self.close_connection = True; return
 
         generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode)
@@ -1499,10 +1853,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 calls = assign_call_ids(parsed["calls"], "call"); finish = "tool_calls"; message["content"] = None
                 message["tool_calls"] = [{"id": call["id"], "type": "function", "function": {"name": call["name"], "arguments": json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":"))}} for call in calls]
             else: message["content"] = output = parsed["content"]
+        usage = openai_usage(base_prompt, output, generation.get("usage"))
         payload: dict[str, Any] = {"id": completion_id, "object": "chat.completion", "created": created, "model": model,
                                    "choices": [{"index": 0, "message": message, "logprobs": None, "finish_reason": finish}],
-                                   "usage": openai_usage(base_prompt, output, generation.get("usage")), "system_fingerprint": "workbuddy-python-" + VERSION}
+                                   "usage": usage, "system_fingerprint": "workbuddy-python-" + VERSION}
         if event_mode: payload.update({"workbuddy_events": generation.get("events", []), "workbuddy_usage": generation.get("usage")})
+        self.app.record_usage(model, "chat", usage, generation.get("usage"))
         self.send_json(200, payload, {"X-Usage-Estimated": "false" if generation.get("usage") else "true"})
 
     def handle_anthropic_count(self, body: dict[str, Any]) -> None:
@@ -1540,6 +1896,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     self.write_sse({"type": "content_block_stop", "index": 0}, "content_block_stop")
             elif block_started: self.write_sse({"type": "content_block_stop", "index": 0}, "content_block_stop")
             usage = anthropic_usage(base_prompt, raw, generation.get("usage"))
+            self.app.record_usage(model, "anthropic", usage, generation.get("usage"))
             self.write_sse({"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence}, "usage": {"output_tokens": usage["output_tokens"]}}, "message_delta")
             self.write_sse({"type": "message_stop"}, "message_stop"); self.close_connection = True; return
 
@@ -1554,10 +1911,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             else:
                 output = parsed["content"]
                 content = [{"type": "text", "text": output}]
+        usage = anthropic_usage(base_prompt, output, generation.get("usage"))
         payload: dict[str, Any] = {"id": message_id, "type": "message", "role": "assistant", "content": content, "model": model,
-                                   "stop_reason": stop_reason, "stop_sequence": stop_sequence,
-                                   "usage": anthropic_usage(base_prompt, output, generation.get("usage"))}
+                                   "stop_reason": stop_reason, "stop_sequence": stop_sequence, "usage": usage}
         if event_mode: payload.update({"workbuddy_events": generation.get("events", []), "workbuddy_usage": generation.get("usage")})
+        self.app.record_usage(model, "anthropic", usage, generation.get("usage"))
         self.send_json(200, payload, {"X-Usage-Estimated": "false" if generation.get("usage") else "true"})
 
 
@@ -1598,8 +1956,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.write_sse({"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": output}, "response.output_text.done")
                 self.write_sse({"type": "response.content_part.done", "item_id": item_id, "output_index": 0, "content_index": 0, "part": item["content"][0]}, "response.content_part.done")
                 self.write_sse({"type": "response.output_item.done", "output_index": 0, "item": item}, "response.output_item.done")
-            completed = {**shell, "status": "completed", "output": items, "output_text": output, "usage": responses_usage(base_prompt, output, generation.get("usage"))}
+            usage = responses_usage(base_prompt, output, generation.get("usage"))
+            completed = {**shell, "status": "completed", "output": items, "output_text": output, "usage": usage}
             if event_mode: completed.update({"workbuddy_events": generation.get("events", []), "workbuddy_usage": generation.get("usage")})
+            self.app.record_usage(model, "responses", usage, generation.get("usage"))
             self.write_sse({"type": "response.completed", "response": completed}, "response.completed"); self.close_connection = True; return
 
         generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode)
@@ -1611,10 +1971,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 items = [{"id": call["id"], "type": "function_call", "status": "completed", "call_id": call["id"], "name": call["name"], "arguments": json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":"))} for call in calls]
             else: output = parsed["content"]; items = [{"id": "msg_" + uid(), "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": output, "annotations": []}]}]
         else: items = [{"id": "msg_" + uid(), "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": output, "annotations": []}]}]
+        usage = responses_usage(base_prompt, output, generation.get("usage"))
         payload: dict[str, Any] = {"id": response_id, "object": "response", "created_at": created, "status": "completed", "error": None,
                                    "incomplete_details": None, "instructions": body.get("instructions"), "model": model, "output": items,
-                                   "output_text": output, "usage": responses_usage(base_prompt, output, generation.get("usage"))}
+                                   "output_text": output, "usage": usage}
         if event_mode: payload.update({"workbuddy_events": generation.get("events", []), "workbuddy_usage": generation.get("usage")})
+        self.app.record_usage(model, "responses", usage, generation.get("usage"))
         self.send_json(200, payload, {"X-Usage-Estimated": "false" if generation.get("usage") else "true"})
 
     def handle_completions(self, body: dict[str, Any]) -> None:
@@ -1628,14 +1990,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                                 "choices": [{"text": value, "index": 0, "logprobs": None, "finish_reason": None}]})
             generation = consume_generation(self.app, model, prompt, conv, "agent", False, delta)
             output = truncate_at_stop(generation["text"], body.get("stop"))
+            usage = openai_usage(prompt, output, generation.get("usage"))
             self.write_sse({"id": completion_id, "object": "text_completion", "created": created, "model": model,
                             "choices": [{"text": "", "index": 0, "logprobs": None, "finish_reason": "stop"}]})
+            self.app.record_usage(model, "completions", usage, generation.get("usage"))
             self.write_sse("[DONE]"); self.close_connection = True; return
         generation = consume_generation(self.app, model, prompt, conv)
         output = truncate_at_stop(generation["text"], body.get("stop"))
+        usage = openai_usage(prompt, output, generation.get("usage"))
+        self.app.record_usage(model, "completions", usage, generation.get("usage"))
         self.send_json(200, {"id": completion_id, "object": "text_completion", "created": created, "model": model,
                              "choices": [{"text": output, "index": 0, "logprobs": None, "finish_reason": "stop"}],
-                             "usage": openai_usage(prompt, output, generation.get("usage"))}, {"X-Usage-Estimated": "true"})
+                             "usage": usage}, {"X-Usage-Estimated": "false" if generation.get("usage") else "true"})
 
 
 def run_mcp_fixture() -> int:
