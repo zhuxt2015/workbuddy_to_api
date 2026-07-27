@@ -37,12 +37,6 @@ cd workbuddy_to_api
 python .\workbuddy_to_api.py --background --api-key local
 ```
 
-也可以使用脚本：
-
-```powershell
-.\start-background.ps1 -ApiKey local
-```
-
 默认地址：
 
 - API 根地址：`http://127.0.0.1:3000`
@@ -53,27 +47,21 @@ python .\workbuddy_to_api.py --background --api-key local
 
 ```powershell
 python .\workbuddy_to_api.py --api-key local
-# 或
-.\start.ps1 -ApiKey local
 ```
 
 ### 查看状态
 
 ```powershell
 python .\workbuddy_to_api.py --status
-# 或
-.\status.ps1
 ```
 
 ### 停止服务
 
 ```powershell
 python .\workbuddy_to_api.py --stop --api-key local
-# 或
-.\stop.ps1 -ApiKey local
 ```
 
-运行日志和状态文件位于 `runtime/`。
+运行日志和状态文件位于 `runtime/`。项目不包含 PowerShell 启动或测试包装脚本；服务管理统一通过 `workbuddy_to_api.py` 执行。
 
 ## OpenAI 客户端配置
 
@@ -149,8 +137,6 @@ print(message.content[0].text)
 Invoke-RestMethod `
   -Uri 'http://127.0.0.1:3000/v1/models' `
   -Headers @{ Authorization = 'Bearer local' }
-
-.\models.ps1 -ApiKey local
 ```
 
 模型别名可通过环境变量配置：
@@ -170,10 +156,6 @@ WORKBUDDY_MODEL_ALIASES={"my-default":"auto","claude-local":"glm-5.2"}
 - Anthropic Messages `tools`
 
 代理会让 WorkBuddy 生成严格 JSON 工具选择结果，然后转换成各协议对应的 `tool_calls`、`function_call` 或 `tool_use`。
-
-```powershell
-.\test-tools.ps1 -BaseUrl http://127.0.0.1:3000 -ApiKey local
-```
 
 ## WorkBuddy 内置工具与事件流
 
@@ -201,10 +183,6 @@ python .\workbuddy_to_api.py `
 - `workbuddy.interruption`
 - `workbuddy.session_end`
 
-```powershell
-.\test-events.ps1 -BaseUrl http://127.0.0.1:3000 -ApiKey local
-```
-
 ## MCP
 
 默认配置发现顺序：
@@ -229,12 +207,6 @@ python .\workbuddy_to_api.py `
 
 ```powershell
 python .\workbuddy_to_api.py --mcp-config .\mcp-example.json --api-key local
-```
-
-测试管理接口：
-
-```powershell
-.\test-mcp-admin.ps1 -BaseUrl http://127.0.0.1:3000 -ApiKey local -Refresh
 ```
 
 ## 环境变量
@@ -267,15 +239,15 @@ python workbuddy_to_api.py --help
 
 常用参数：`--host`、`--port`、`--api-key`、`--model`、`--cwd`、`--background`、`--status`、`--stop`、`--disable-tools`、`--mcp-config`。
 
-## 测试
+## 连通性检查
+
+服务启动后，可用以下命令检查服务状态和模型列表：
 
 ```powershell
-.\test.ps1 -BaseUrl http://127.0.0.1:3000/v1 -ApiKey local
-.\test.ps1 -BaseUrl http://127.0.0.1:3000/v1 -ApiKey local -Stream
-.\test-anthropic.ps1 -BaseUrl http://127.0.0.1:3000 -ApiKey local
-.\test-tools.ps1 -BaseUrl http://127.0.0.1:3000 -ApiKey local
-.\test-events.ps1 -BaseUrl http://127.0.0.1:3000 -ApiKey local
-.\test-mcp-admin.ps1 -BaseUrl http://127.0.0.1:3000 -ApiKey local
+Invoke-RestMethod -Uri 'http://127.0.0.1:3000/health'
+Invoke-RestMethod `
+  -Uri 'http://127.0.0.1:3000/v1/models' `
+  -Headers @{ Authorization = 'Bearer local' }
 ```
 
 ## 安装为命令
@@ -328,18 +300,12 @@ Get-Content .\runtime\gateway-auto-agent.err.log -Tail 100
 
 ```text
 workbuddy_to_api/
-├─ workbuddy_to_api.py       # Python 主程序
+├─ workbuddy_to_api.py       # Python 主程序与命令行入口
 ├─ admin.html                # MCP 管理页
 ├─ pyproject.toml            # Python 项目元数据
 ├─ .env.example              # 配置示例
 ├─ mcp-example.json          # MCP 测试配置
-├─ start.ps1                 # 前台启动
-├─ start-background.ps1      # 后台启动
-├─ status.ps1                # 状态
-├─ stop.ps1                  # 停止
-├─ models.ps1                # 模型列表
-├─ test*.ps1                 # 回归测试
-└─ runtime/                  # 运行时状态与日志
+└─ runtime/                  # 运行时状态与日志（不纳入 Git）
 ```
 
 ## License
