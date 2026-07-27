@@ -250,25 +250,6 @@ Invoke-RestMethod `
   -Headers @{ Authorization = 'Bearer local' }
 ```
 
-## 安装为命令
-
-```powershell
-python -m pip install -e .
-workbuddy-to-api --background --api-key local
-```
-
-## GitHub 上传
-
-```powershell
-git init
-git add .
-git commit -m "Initial Python release"
-git branch -M main
-git remote add origin YOUR_GITHUB_REPOSITORY
-git push -u origin main
-```
-
-提交前检查 `.env`、`runtime/` 和 MCP 配置中的令牌信息。它们已在 `.gitignore` 中排除或应使用占位值。
 
 ## 常见问题
 
