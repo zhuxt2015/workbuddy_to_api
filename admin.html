@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>workbuddy_to_api 管理台</title>
+  <style>
+    :root{color-scheme:dark;--bg:#081018;--panel:#111d28;--panel2:#0d1720;--line:#263747;--text:#e8f1f8;--muted:#91a6b8;--cyan:#45d7d0;--green:#61d68b;--yellow:#f7ca67;--red:#ff7d86;--shadow:0 18px 50px #0007}
+    *{box-sizing:border-box} body{margin:0;font:14px/1.5 Inter,ui-sans-serif,system-ui,"Microsoft YaHei",sans-serif;background:radial-gradient(circle at 12% 0,#143047 0,transparent 32%),linear-gradient(145deg,#060c12,#0a1118 48%,#07141a);color:var(--text);min-height:100vh}
+    .shell{max-width:1320px;margin:auto;padding:28px}.top{display:flex;gap:18px;align-items:center;justify-content:space-between;margin-bottom:20px}.brand h1{margin:0;font-size:25px;letter-spacing:.2px}.brand p{margin:5px 0 0;color:var(--muted)}
+    .auth{display:flex;gap:9px;flex-wrap:wrap;justify-content:flex-end}.auth input,.search{background:#09131c;border:1px solid var(--line);border-radius:10px;color:var(--text);padding:10px 12px;outline:none}.auth input{width:190px}.auth input:focus,.search:focus{border-color:var(--cyan)}
+    button{border:1px solid #315064;background:#152b3a;color:var(--text);border-radius:10px;padding:9px 13px;cursor:pointer;font-weight:650}button:hover{border-color:var(--cyan);transform:translateY(-1px)}button.primary{background:linear-gradient(135deg,#128b8b,#236caa);border:0}button.warn{border-color:#765f2d;color:#ffe09a}
+    .grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px;margin-bottom:16px}.card,.section{background:linear-gradient(180deg,#12202cdd,#0d1822ee);border:1px solid var(--line);border-radius:15px;box-shadow:var(--shadow)}.card{padding:16px}.card .label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.card .value{font-size:24px;font-weight:760;margin-top:4px;overflow-wrap:anywhere}.ok{color:var(--green)}.bad{color:var(--red)}.pending{color:var(--yellow)}
+    .section{padding:16px;margin-top:15px}.section-head{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:12px}.section h2{font-size:16px;margin:0}.actions{display:flex;gap:8px;flex-wrap:wrap}.search{width:260px}
+    .table-wrap{overflow:auto;border:1px solid #20313f;border-radius:11px}table{width:100%;border-collapse:collapse;min-width:860px}th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #20313f;vertical-align:top}th{position:sticky;top:0;background:#132330;color:#b7c8d6;font-size:12px;letter-spacing:.04em}tr:last-child td{border-bottom:0}tbody tr:hover{background:#14243099}.pill{display:inline-flex;align-items:center;border:1px solid #345065;border-radius:999px;padding:2px 8px;font-size:12px;color:#c8d9e7}.pill.ok{border-color:#397b54}.pill.bad{border-color:#8f4550}.muted{color:var(--muted)}code{color:#8de6e1;background:#071017;border:1px solid #1f3442;padding:2px 5px;border-radius:5px}.schema{max-width:500px;white-space:pre-wrap;font-size:12px;color:#a9bdcc}.empty{padding:30px;text-align:center;color:var(--muted)}
+    .toast{position:fixed;right:22px;bottom:22px;max-width:460px;background:#122533;border:1px solid #36566d;border-radius:12px;padding:12px 15px;box-shadow:var(--shadow);display:none;white-space:pre-wrap}.toast.show{display:block}.footer{color:#6f8597;text-align:center;padding:22px}
+    @media(max-width:900px){.grid{grid-template-columns:repeat(2,1fr)}.top{align-items:flex-start;flex-direction:column}.auth{justify-content:flex-start}.shell{padding:18px}}@media(max-width:520px){.grid{grid-template-columns:1fr}.search{width:100%}}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="top">
+      <div class="brand"><h1>workbuddy_to_api 管理台</h1><p>OpenAI · Anthropic · WorkBuddy Tools · MCP</p></div>
+      <div class="auth"><input id="apiKey" type="password" placeholder="API Key（例如 local）"><button id="saveKey">保存 Key</button><button class="primary" id="refreshAll">刷新全部</button></div>
+    </header>
+
+    <section class="grid">
+      <article class="card"><div class="label">代理状态</div><div class="value" id="status">读取中</div></article>
+      <article class="card"><div class="label">模型数量</div><div class="value" id="models">-</div></article>
+      <article class="card"><div class="label">MCP 服务器</div><div class="value" id="serversCount">-</div></article>
+      <article class="card"><div class="label">MCP 工具</div><div class="value" id="toolsCount">-</div></article>
+    </section>
+
+    <section class="section">
+      <div class="section-head"><h2>MCP 服务器</h2><div class="actions"><button id="reloadMcp" class="warn">重新载入配置</button><button id="testAll">测试全部</button></div></div>
+      <div class="table-wrap"><table><thead><tr><th>名称</th><th>来源</th><th>传输</th><th>地址 / 命令</th><th>状态</th><th>工具</th><th>延迟</th><th>操作</th></tr></thead><tbody id="serversBody"><tr><td colspan="8" class="empty">读取中</td></tr></tbody></table></div>
+    </section>
+
+    <section class="section">
+      <div class="section-head"><h2>工具清单</h2><div class="actions"><input id="toolSearch" class="search" placeholder="搜索工具名、服务器或说明"><button id="refreshTools">强制刷新工具</button></div></div>
+      <div class="table-wrap"><table><thead><tr><th>WorkBuddy 工具名</th><th>服务器</th><th>原始名称</th><th>说明</th><th>输入结构</th></tr></thead><tbody id="toolsBody"><tr><td colspan="5" class="empty">点击“刷新全部”读取工具</td></tr></tbody></table></div>
+    </section>
+
+    <section class="section">
+      <div class="section-head"><h2>运行中的 Gateway</h2></div>
+      <div class="table-wrap"><table><thead><tr><th>模型</th><th>配置</th><th>工具</th><th>端口</th><th>PID</th><th>状态</th></tr></thead><tbody id="gatewaysBody"><tr><td colspan="6" class="empty">读取中</td></tr></tbody></table></div>
+    </section>
+    <div class="footer">本机管理页面 · <code>/admin</code></div>
+  </main>
+  <div id="toast" class="toast"></div>
+<script>
+const $=id=>document.getElementById(id); let allTools=[];
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function key(){return $('apiKey').value.trim()} function headers(json=false){const h={};if(key())h.Authorization='Bearer '+key();if(json)h['Content-Type']='application/json';return h}
+function toast(text,bad=false){const el=$('toast');el.textContent=text;el.style.borderColor=bad?'#8f4550':'#36566d';el.classList.add('show');clearTimeout(el.t);el.t=setTimeout(()=>el.classList.remove('show'),5000)}
+async function api(url,options={}){const r=await fetch(url,{...options,headers:{...headers(Boolean(options.body)),...(options.headers||{})}});const text=await r.text();let data;try{data=JSON.parse(text)}catch{data={message:text}}if(!r.ok)throw new Error(data?.error?.message||data?.message||('HTTP '+r.status));return data}
+function pill(status){const cls=status==='ok'?'ok':status==='error'?'bad':'pending';return `<span class="pill ${cls}">${esc(status)}</span>`}
+async function loadHealth(){const h=await api('/health');$('status').textContent=h.status==='ok'?'正常':'异常';$('status').className='value '+(h.status==='ok'?'ok':'bad');$('models').textContent=h.model_count;$('gatewaysBody').innerHTML=(h.active_gateways||[]).map(g=>`<tr><td><code>${esc(g.model)}</code></td><td>${esc(g.profile)}</td><td>${g.tools_enabled?'开启':'关闭'}</td><td>${esc(g.port)}</td><td>${esc(g.pid)}</td><td>${pill(g.ready?'ok':'starting')}</td></tr>`).join('')||'<tr><td colspan="6" class="empty">当前还没有 Gateway，首次 API 请求时自动启动</td></tr>'}
+async function loadServers(){const d=await api('/admin/mcp/servers');$('serversCount').textContent=d.summary.server_count;const body=$('serversBody');body.innerHTML=d.data.map(s=>`<tr><td><code>${esc(s.name)}</code></td><td>${esc(s.source||'-')}</td><td>${esc(s.transport)}</td><td>${s.url?`<code>${esc(s.url)}</code>`:`<code>${esc(s.command||'-')}</code>`}</td><td>${pill(s.status)}</td><td>${esc(s.tool_count??'-')}</td><td>${s.latency_ms==null?'-':esc(s.latency_ms)+' ms'}</td><td><button data-test="${esc(s.name)}">测试</button></td></tr>`).join('')||'<tr><td colspan="8" class="empty">当前没有 MCP 配置</td></tr>';body.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>testServer(b.dataset.test))}
+function renderTools(){const q=$('toolSearch').value.trim().toLowerCase();const list=allTools.filter(t=>!q||[t.workbuddy_name,t.server,t.name,t.description].some(v=>String(v||'').toLowerCase().includes(q)));$('toolsBody').innerHTML=list.map(t=>`<tr><td><code>${esc(t.workbuddy_name)}</code></td><td>${esc(t.server)}</td><td>${esc(t.name)}</td><td>${esc(t.description||'-')}</td><td><details><summary>JSON Schema</summary><pre class="schema">${esc(JSON.stringify(t.input_schema,null,2))}</pre></details></td></tr>`).join('')||'<tr><td colspan="5" class="empty">没有匹配的工具</td></tr>'}
+async function loadTools(force=false){$('toolsBody').innerHTML='<tr><td colspan="5" class="empty">正在连接 MCP 服务器并读取工具……</td></tr>';const d=await api('/admin/mcp/tools'+(force?'?refresh=1':''));allTools=d.data||[];$('toolsCount').textContent=d.tool_count;renderTools();await loadServers();const errors=(d.servers||[]).filter(s=>s.status!=='ok');if(errors.length)toast(errors.map(x=>x.name+': '+x.error).join('\n'),true)}
+async function testServer(server){try{toast('正在测试 '+server+' …');const d=await api('/admin/mcp/test',{method:'POST',body:JSON.stringify({server})});toast(`${server}: ${d.status}，${d.tool_count} 个工具，${d.latency_ms??'-'} ms`,d.status!=='ok');await loadServers()}catch(e){toast(e.message,true)}}
+async function refreshAll(force=false){try{await Promise.all([loadHealth(),loadServers()]);await loadTools(force)}catch(e){toast(e.message,true)}}
+$('saveKey').onclick=()=>{localStorage.setItem('wbProxyApiKey',key());toast('API Key 已保存到当前浏览器')};$('refreshAll').onclick=()=>refreshAll(false);$('refreshTools').onclick=()=>loadTools(true);$('testAll').onclick=()=>loadTools(true);$('toolSearch').oninput=renderTools;
+$('reloadMcp').onclick=async()=>{try{const d=await api('/admin/mcp/reload',{method:'POST',body:'{}'});toast(`MCP 已重新载入；配置变化=${d.changed}；重启 Gateway=${d.restarted_gateways}`);await refreshAll(true)}catch(e){toast(e.message,true)}};
+$('apiKey').value=localStorage.getItem('wbProxyApiKey')||'local';refreshAll(false);
+</script>
+</body>
+</html>
