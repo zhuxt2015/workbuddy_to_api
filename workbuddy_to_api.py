@@ -373,12 +373,14 @@ CLIENT-SIDE TOOL SELECTION PROTOCOL
 The tools below are executed by the API client. Do not execute these client tools as internal WorkBuddy tools.
 Return exactly one JSON object and no markdown fence.
 For tool calls:
-{{"type":"tool_calls","calls":[{{"name":"TOOL_NAME","arguments":{{}}}}]}}
+{{"type":"tool_calls","commentary":"OPTIONAL_PROGRESS_TEXT","calls":[{{"name":"TOOL_NAME","arguments":{{}}}}]}}
 For a final response:
 {{"type":"final","content":"FINAL_TEXT"}}
 {mode}
 {parallel}
 Use only declared tool names. Arguments must be a JSON object matching the declared input schema.
+Never return a progress update by itself or label future work as a final response. If you say that you will inspect, read, search, run, edit, or verify something, include the required tool call in the same tool_calls object.
+The complete tool-call envelope must be valid JSON: escape every double quote inside a string value and encode line breaks as \\n. In particular, the `input` string for the exec tool contains JavaScript and must not contain unescaped quotes.
 If the conversation already contains tool results, use those results and return a final response unless another declared call is needed.
 
 Declared client tools:
@@ -411,8 +413,67 @@ def normalize_arguments(value: Any) -> dict[str, Any]:
     return {"value": value}
 
 
+def decode_relaxed_json_string(value: str) -> str:
+    """Decode common JSON escapes without rejecting an otherwise recoverable tool payload."""
+    result: list[str] = []; index = 0
+    escapes = {"\\\"": "\"", "\\\\": "\\", "\\/": "/", "\\b": "\\b", "\\f": "\\f", "\\n": "\\n", "\\r": "\\r", "\\t": "\\t"}
+    while index < len(value):
+        if value[index] != "\\" or index + 1 >= len(value):
+            result.append(value[index]); index += 1; continue
+        token = value[index:index + 2]
+        if token == "\\u" and index + 6 <= len(value):
+            try:
+                result.append(chr(int(value[index + 2:index + 6], 16))); index += 6; continue
+            except ValueError: pass
+        result.append(escapes.get(token, value[index + 1])); index += 2
+    return "".join(result)
+
+
+def normalize_exec_input(value: str) -> str:
+    """Turn double-escaped line breaks back into source newlines for client exec calls."""
+    if "\n" in value or "\\n" not in value:
+        return value
+    if not re.search(r"//\s*@exec:|\b(?:const|let|var|for|await)\b|tools\.exec_command", value):
+        return value
+    return value.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
+
+
+def normalize_tool_arguments(name: str, value: Any) -> dict[str, Any]:
+    arguments = normalize_arguments(value)
+    if name == "exec" and isinstance(arguments.get("input"), str):
+        arguments = dict(arguments)
+        arguments["input"] = normalize_exec_input(arguments["input"])
+    return arguments
+
+
+def parse_relaxed_exec_output(raw: str, tools: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Recover one common malformed exec envelope emitted by WorkBuddy."""
+    if not re.search(r'"type"\s*:\s*"tool_calls"', raw): return None
+    text = raw.strip(); first, last = text.find("{"), text.rfind("}")
+    if first < 0 or last <= first: return None
+    text = text[first:last + 1]
+    allowed = {x["name"] for x in tools}
+    name_match = re.search(r'"name"\s*:\s*"([^"\\]+)"\s*,\s*"arguments"\s*:', text)
+    if not name_match or name_match.group(1) not in allowed: return None
+    input_match = re.search(
+        r'"arguments"\s*:\s*\{\s*"input"\s*:\s*"([\s\S]*)"\s*'
+        r'(?:\}\s*){1,2}\]\s*\}(?:\s*\]\s*\})?\s*$',
+        text,
+    )
+    if not input_match: return None
+    call_id = None
+    id_match = re.search(r'"id"\s*:\s*"([^"\\]+)"', text[:name_match.start()])
+    if id_match: call_id = id_match.group(1)
+    name = name_match.group(1)
+    arguments = normalize_tool_arguments(name, {"input": decode_relaxed_json_string(input_match.group(1))})
+    return {"type": "tool_calls", "calls": [{"id": call_id, "name": name, "arguments": arguments}], "commentary": ""}
+
+
 def parse_client_tool_output(raw: str, tools: list[dict[str, Any]], choice: dict[str, Any]) -> dict[str, Any]:
     parsed = parse_json_object(raw); allowed = {x["name"] for x in tools}; calls = []
+    if parsed is None:
+        recovered = parse_relaxed_exec_output(raw, tools)
+        if recovered is not None: return recovered
     source = []
     if parsed:
         if isinstance(parsed.get("calls"), list): source = parsed["calls"]
@@ -424,7 +485,7 @@ def parse_client_tool_output(raw: str, tools: list[dict[str, Any]], choice: dict
         name = str(fn.get("name") or entry.get("name") or "").strip()
         if name not in allowed: continue
         args = fn.get("arguments", fn.get("input", entry.get("arguments", entry.get("input", {}))))
-        calls.append({"id": str(entry.get("id") or "").strip() or None, "name": name, "arguments": normalize_arguments(args)})
+        calls.append({"id": str(entry.get("id") or "").strip() or None, "name": name, "arguments": normalize_tool_arguments(name, args)})
     if not choice["parallel"]: calls = calls[:1]
     if choice["mode"] == "specific": calls = [x for x in calls if x["name"] == choice["name"]]
     if not calls and parsed and (choice["mode"] == "specific" or len(tools) == 1):
@@ -434,18 +495,33 @@ def parse_client_tool_output(raw: str, tools: list[dict[str, Any]], choice: dict
             if isinstance(parsed.get("arguments"), dict): args = parsed["arguments"]
             elif isinstance(parsed.get("input"), dict): args = parsed["input"]
             else: args = {k: v for k, v in parsed.items() if k not in {"type", "content", "text", "answer", "calls", "tool_calls", "name"}}
-            calls = [{"id": None, "name": inferred, "arguments": args}]
-    if calls: return {"type": "tool_calls", "calls": calls}
-    if parsed:
-        content = parsed.get("content", parsed.get("answer", parsed.get("text")))
-        if isinstance(content, str): return {"type": "final", "content": content}
-    return {"type": "final", "content": str(raw or "")}
+            calls = [{"id": None, "name": inferred, "arguments": normalize_tool_arguments(inferred, args)}]
+    if calls:
+        commentary = parsed.get("commentary", parsed.get("content")) if parsed else None
+        return {"type": "tool_calls", "calls": calls, "commentary": commentary if isinstance(commentary, str) else ""}
+    if parsed and parsed.get("type") == "final":
+        content = parsed.get("content")
+        if isinstance(content, str) and choice["mode"] not in {"required", "specific"}:
+            return {"type": "final", "content": content}
+        reason = "tool_choice requires a tool call" if choice["mode"] in {"required", "specific"} else "final content must be a string"
+        return {"type": "invalid", "reason": reason}
+    if parsed is None:
+        return {"type": "invalid", "reason": "response is not a valid protocol JSON object"}
+    return {"type": "invalid", "reason": "response is neither a valid tool call nor a final response"}
 
 
 def make_tool_plan(body: dict[str, Any], protocol: str, base_prompt: str) -> dict[str, Any]:
     tools = normalize_client_tools(body, protocol); choice = normalize_tool_choice(body, protocol)
     enabled = bool(tools) and choice["mode"] != "none"
     return {"tools": tools, "choice": choice, "enabled": enabled, "profile": "protocol" if enabled else "agent", "prompt": build_client_tool_prompt(base_prompt, tools, choice) if enabled else base_prompt}
+
+
+def build_protocol_repair_prompt(tools: list[dict[str, Any]], choice: dict[str, Any]) -> str:
+    return build_client_tool_prompt(
+        "Your previous response did not follow the client-side tool protocol. Continue the same request and retry now. Do not repeat a progress update without its tool call.",
+        tools,
+        choice,
+    )
 
 
 def assign_call_ids(calls: list[dict[str, Any]], prefix: str) -> list[dict[str, Any]]:
@@ -488,6 +564,7 @@ class Config:
     event_max_bytes: int
     max_turns: int
     request_timeout_ms: int
+    sse_heartbeat_ms: int
     start_timeout_ms: int
     system_prompt: str
     protocol_system_prompt: str
@@ -509,7 +586,8 @@ class Config:
         account_session_path = Path(os.getenv("WORKBUDDY_ACCOUNT_SESSION_PATH") or default_account_session).expanduser().resolve()
         catalog = load_model_catalog(cli_script, Path.home())
         configured = split_csv(os.getenv("WORKBUDDY_MODELS"), [])
-        ids = configured or [x["id"] for x in catalog["models"]]
+        available = catalog["cliModels"] or [x["id"] for x in catalog["models"]]
+        ids = configured or available
         default_model = args.model or os.getenv("WORKBUDDY_DEFAULT_MODEL") or "auto"
         if default_model not in ids: ids.insert(0, default_model)
         aliases = parse_aliases(os.getenv("WORKBUDDY_MODEL_ALIASES"))
@@ -542,7 +620,8 @@ class Config:
             mcp_admin_cache_ms=env_int("WORKBUDDY_MCP_ADMIN_CACHE_MS", 30000),
             event_max_bytes=args.event_max_bytes or env_int("WORKBUDDY_EVENT_MAX_BYTES", 65536),
             max_turns=args.max_turns or env_int("WORKBUDDY_MAX_TURNS", 8),
-            request_timeout_ms=env_int("WORKBUDDY_REQUEST_TIMEOUT_MS", 300000),
+            request_timeout_ms=env_int("WORKBUDDY_REQUEST_TIMEOUT_MS", 900000),
+            sse_heartbeat_ms=env_int("WORKBUDDY_SSE_HEARTBEAT_MS", 15000),
             start_timeout_ms=env_int("WORKBUDDY_START_TIMEOUT_MS", 45000),
             system_prompt=os.getenv("WORKBUDDY_SYSTEM_PROMPT") or "You are serving an API chat request. Answer the user directly. Use WorkBuddy built-in tools and configured MCP tools when they help complete the request.",
             protocol_system_prompt="You are a deterministic API tool-selection adapter. Follow the client-side tool protocol in the prompt, emit the requested JSON envelope, and do not invoke internal tools.",
@@ -555,7 +634,8 @@ class Config:
         if not force and current - self.last_catalog_refresh_ms < 10000: return False
         self.last_catalog_refresh_ms = current
         latest = load_model_catalog(self.cli_script, Path.home())
-        ids = [x["id"] for x in latest["models"]]
+        available = latest["cliModels"] or [x["id"] for x in latest["models"]]
+        ids = available
         if self.default_model not in ids: ids.insert(0, self.default_model)
         changed = latest["source"] != self.model_catalog_source or latest.get("updatedAt") != self.model_catalog_updated_at or ids != self.models
         if changed:
@@ -1429,6 +1509,24 @@ def consume_generation(app: "ProxyApplication", model: str, prompt: str, convers
     return {"text": text, "events": [], "usage": None, "stopReason": "end_turn"}
 
 
+def resolve_client_tool_output(app: "ProxyApplication", model: str, plan: dict[str, Any], conversation: str,
+                               generation: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    parsed = parse_client_tool_output(generation.get("text", ""), plan["tools"], plan["choice"])
+    if parsed["type"] != "invalid":
+        return generation, parsed
+    log("protocol", f"repairing invalid client tool output: {parsed['reason']}")
+    repaired = consume_generation(app, model, build_protocol_repair_prompt(plan["tools"], plan["choice"]),
+                                  conversation, "protocol")
+    parsed = parse_client_tool_output(repaired.get("text", ""), plan["tools"], plan["choice"])
+    if parsed["type"] == "invalid":
+        raise ProxyError(
+            502,
+            "tool_protocol_error",
+            f"WorkBuddy did not return a valid client tool protocol response after one repair attempt: {parsed['reason']}.",
+        )
+    return repaired, parsed
+
+
 def normalize_content(content: Any) -> str:
     if isinstance(content, str): return content
     if content is None: return ""
@@ -1507,9 +1605,29 @@ def responses_to_prompt(body: dict[str, Any]) -> str:
     if isinstance(source, str): prompt = source
     elif isinstance(source, list):
         messages = []
+        call_names: dict[str, str] = {}
         for item in source:
             if isinstance(item, str): messages.append({"role": "user", "content": item})
-            elif isinstance(item, dict): messages.append({"role": item.get("role", "user"), "content": item.get("content", item.get("text", "")), "name": item.get("name")})
+            elif isinstance(item, dict):
+                typ = str(item.get("type") or "")
+                call_id = str(item.get("call_id") or "").strip()
+                if typ in {"custom_tool_call", "function_call"}:
+                    name = str(item.get("name") or "").strip()
+                    if call_id and name: call_names[call_id] = name
+                    if typ == "custom_tool_call":
+                        call = {"id": call_id, "type": "custom", "custom": {"name": name, "input": item.get("input", "")}}
+                    else:
+                        call = {"id": call_id, "type": "function", "function": {"name": name, "arguments": item.get("arguments", "")}}
+                    messages.append({"role": "assistant", "content": "", "tool_calls": [call]})
+                elif typ in {"custom_tool_call_output", "function_call_output"}:
+                    messages.append({
+                        "role": "tool",
+                        "content": item.get("output", ""),
+                        "name": item.get("name") or call_names.get(call_id),
+                        "tool_call_id": call_id,
+                    })
+                else:
+                    messages.append({"role": item.get("role", "user"), "content": item.get("content", item.get("text", "")), "name": item.get("name")})
         prompt = messages_to_prompt(messages or [{"role": "user", "content": ""}], body)
     else: prompt = normalize_content(source)
     instructions = normalize_content(body.get("instructions")).strip()
@@ -1644,6 +1762,7 @@ class ProxyApplication:
                 "base_url": f"http://{self.config.host}:{self.config.port}", "started_at": _dt.datetime.fromtimestamp(self.started_at, _dt.timezone.utc).isoformat().replace("+00:00", "Z"),
                 "uptime_seconds": round(time.time() - self.started_at, 3), "default_model": self.config.default_model,
                 "models": self.config.models, "model_count": len(self.config.models), "model_catalog_source": self.config.model_catalog_source,
+                "request_timeout_ms": self.config.request_timeout_ms, "sse_heartbeat_ms": self.config.sse_heartbeat_ms,
                 "mcp": self.mcp_admin.summary(), "gateways": self.gateways.list(), "python": sys.version.split()[0]}
 
     def write_runtime_state(self) -> None:
@@ -1658,6 +1777,10 @@ class ProxyApplication:
 class ApiHandler(BaseHTTPRequestHandler):
     server_version = f"{APP_NAME}/{VERSION}"
     protocol_version = "HTTP/1.1"
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        self._sse_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
 
     @property
     def app(self) -> ProxyApplication:
@@ -1691,9 +1814,31 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def write_sse(self, data: Any, event: Optional[str] = None) -> None:
-        if event: self.wfile.write(f"event: {event}\n".encode("utf-8"))
         raw = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-        self.wfile.write(f"data: {raw}\n\n".encode("utf-8")); self.wfile.flush()
+        frame = (f"event: {event}\n" if event else "") + f"data: {raw}\n\n"
+        with self._sse_lock:
+            self.wfile.write(frame.encode("utf-8")); self.wfile.flush()
+
+    @contextlib.contextmanager
+    def sse_heartbeat(self):
+        """Keep an active streaming response alive while WorkBuddy is thinking."""
+        stopped = threading.Event()
+        interval = max(1000, self.app.config.sse_heartbeat_ms) / 1000
+
+        def beat() -> None:
+            while not stopped.wait(interval):
+                try:
+                    self.write_sse({"type": "response.heartbeat"}, "response.heartbeat")
+                except (OSError, ValueError):
+                    return
+
+        worker = threading.Thread(target=beat, name="workbuddy-sse-heartbeat", daemon=True)
+        worker.start()
+        try:
+            yield
+        finally:
+            stopped.set()
+            worker.join(timeout=1)
 
     def read_json(self, limit: int = 10 * 1024 * 1024) -> dict[str, Any]:
         try: size = int(self.headers.get("Content-Length", "0") or 0)
@@ -1825,17 +1970,27 @@ class ApiHandler(BaseHTTPRequestHandler):
                                     "choices": [{"index": 0, "delta": {"content": value}, "logprobs": None, "finish_reason": None}]})
             def event(value: dict[str, Any]) -> None: self.write_sse(value, value.get("type", "workbuddy.event"))
             generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode, delta, event)
-            finish = "stop"; output = truncate_at_stop(generation["text"], body.get("stop"))
+            finish = "stop"
             if plan["enabled"]:
-                parsed = parse_client_tool_output(output, plan["tools"], plan["choice"])
+                try:
+                    generation, parsed = resolve_client_tool_output(self.app, model, plan, conv, generation)
+                except ProxyError as exc:
+                    self.write_sse({"error": {"message": str(exc), "type": "server_error", "param": None, "code": exc.code}})
+                    self.write_sse("[DONE]"); self.close_connection = True; return
                 if parsed["type"] == "tool_calls":
+                    output = parsed["commentary"]
+                    if output:
+                        self.write_sse({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                        "choices": [{"index": 0, "delta": {"content": output}, "logprobs": None, "finish_reason": None}]})
                     calls = assign_call_ids(parsed["calls"], "call"); finish = "tool_calls"
                     for index, call in enumerate(calls):
                         self.write_sse({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
                                         "choices": [{"index": 0, "delta": {"tool_calls": [{"index": index, "id": call["id"], "type": "function", "function": {"name": call["name"], "arguments": json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":"))}}]}, "logprobs": None, "finish_reason": None}]})
                 else:
-                    output = parsed["content"]
+                    output = truncate_at_stop(parsed["content"], body.get("stop"))
                     if output: self.write_sse({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {"content": output}, "logprobs": None, "finish_reason": None}]})
+            else:
+                output = truncate_at_stop(generation["text"], body.get("stop"))
             self.write_sse({"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
                             "choices": [{"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish}]})
             usage = openai_usage(base_prompt, output, generation.get("usage"))
@@ -1845,14 +2000,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.write_sse("[DONE]"); self.close_connection = True; return
 
         generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode)
-        output = truncate_at_stop(generation["text"], body.get("stop")); finish = "stop"
+        finish = "stop"; output = truncate_at_stop(generation["text"], body.get("stop"))
         message: dict[str, Any] = {"role": "assistant", "content": output, "refusal": None}
         if plan["enabled"]:
-            parsed = parse_client_tool_output(output, plan["tools"], plan["choice"])
+            generation, parsed = resolve_client_tool_output(self.app, model, plan, conv, generation)
             if parsed["type"] == "tool_calls":
-                calls = assign_call_ids(parsed["calls"], "call"); finish = "tool_calls"; message["content"] = None
+                output = parsed["commentary"]
+                calls = assign_call_ids(parsed["calls"], "call"); finish = "tool_calls"; message["content"] = output or None
                 message["tool_calls"] = [{"id": call["id"], "type": "function", "function": {"name": call["name"], "arguments": json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":"))}} for call in calls]
-            else: message["content"] = output = parsed["content"]
+            else: message["content"] = output = truncate_at_stop(parsed["content"], body.get("stop"))
         usage = openai_usage(base_prompt, output, generation.get("usage"))
         payload: dict[str, Any] = {"id": completion_id, "object": "chat.completion", "created": created, "model": model,
                                    "choices": [{"index": 0, "message": message, "logprobs": None, "finish_reason": finish}],
@@ -1880,21 +2036,30 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.write_sse({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": value}}, "content_block_delta")
             def event(value: dict[str, Any]) -> None: self.write_sse(value, value.get("type", "workbuddy.event"))
             generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode, delta, event)
-            raw, stop_reason, stop_sequence = limit_anthropic_output(generation["text"], body.get("stop_sequences"), body.get("max_tokens"))
             if plan["enabled"]:
-                parsed = parse_client_tool_output(raw, plan["tools"], plan["choice"])
+                try:
+                    generation, parsed = resolve_client_tool_output(self.app, model, plan, conv, generation)
+                except ProxyError as exc:
+                    self.write_sse({"type": "error", "error": {"type": "api_error", "message": str(exc)}}, "error")
+                    self.close_connection = True; return
                 if parsed["type"] == "tool_calls":
-                    stop_reason = "tool_use"
-                    for index, call in enumerate(assign_call_ids(parsed["calls"], "toolu")):
+                    raw = parsed["commentary"]; stop_reason = "tool_use"; stop_sequence = None; offset = 0
+                    if raw:
+                        self.write_sse({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}, "content_block_start")
+                        self.write_sse({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": raw}}, "content_block_delta")
+                        self.write_sse({"type": "content_block_stop", "index": 0}, "content_block_stop"); offset = 1
+                    for index, call in enumerate(assign_call_ids(parsed["calls"], "toolu"), start=offset):
                         self.write_sse({"type": "content_block_start", "index": index, "content_block": {"type": "tool_use", "id": call["id"], "name": call["name"], "input": {}}}, "content_block_start")
                         self.write_sse({"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":"))}}, "content_block_delta")
                         self.write_sse({"type": "content_block_stop", "index": index}, "content_block_stop")
                 else:
-                    raw = parsed["content"]
+                    raw, stop_reason, stop_sequence = limit_anthropic_output(parsed["content"], body.get("stop_sequences"), body.get("max_tokens"))
                     self.write_sse({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}, "content_block_start")
                     self.write_sse({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": raw}}, "content_block_delta")
                     self.write_sse({"type": "content_block_stop", "index": 0}, "content_block_stop")
-            elif block_started: self.write_sse({"type": "content_block_stop", "index": 0}, "content_block_stop")
+            else:
+                raw, stop_reason, stop_sequence = limit_anthropic_output(generation["text"], body.get("stop_sequences"), body.get("max_tokens"))
+                if block_started: self.write_sse({"type": "content_block_stop", "index": 0}, "content_block_stop")
             usage = anthropic_usage(base_prompt, raw, generation.get("usage"))
             self.app.record_usage(model, "anthropic", usage, generation.get("usage"))
             self.write_sse({"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence}, "usage": {"output_tokens": usage["output_tokens"]}}, "message_delta")
@@ -1904,12 +2069,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         output, stop_reason, stop_sequence = limit_anthropic_output(generation["text"], body.get("stop_sequences"), body.get("max_tokens"))
         content: list[dict[str, Any]] = [{"type": "text", "text": output}]
         if plan["enabled"]:
-            parsed = parse_client_tool_output(output, plan["tools"], plan["choice"])
+            generation, parsed = resolve_client_tool_output(self.app, model, plan, conv, generation)
             if parsed["type"] == "tool_calls":
-                stop_reason = "tool_use"; stop_sequence = None
-                content = [{"type": "tool_use", "id": call["id"], "name": call["name"], "input": call["arguments"]} for call in assign_call_ids(parsed["calls"], "toolu")]
+                output = parsed["commentary"]; stop_reason = "tool_use"; stop_sequence = None
+                content = ([{"type": "text", "text": output}] if output else []) + [{"type": "tool_use", "id": call["id"], "name": call["name"], "input": call["arguments"]} for call in assign_call_ids(parsed["calls"], "toolu")]
             else:
-                output = parsed["content"]
+                output, stop_reason, stop_sequence = limit_anthropic_output(parsed["content"], body.get("stop_sequences"), body.get("max_tokens"))
                 content = [{"type": "text", "text": output}]
         usage = anthropic_usage(base_prompt, output, generation.get("usage"))
         payload: dict[str, Any] = {"id": message_id, "type": "message", "role": "assistant", "content": content, "model": model,
@@ -1938,19 +2103,48 @@ class ApiHandler(BaseHTTPRequestHandler):
                     self.write_sse({"type": "response.content_part.added", "item_id": item_id, "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}, "response.content_part.added"); started = True
                 self.write_sse({"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": value}, "response.output_text.delta")
             def event(value: dict[str, Any]) -> None: self.write_sse(value, value.get("type", "workbuddy.event"))
-            generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode, delta, event)
+            try:
+                with self.sse_heartbeat():
+                    generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode, delta, event)
+                    if plan["enabled"]:
+                        generation, parsed = resolve_client_tool_output(self.app, model, plan, conv, generation)
+            except ProxyError as exc:
+                error = {"code": exc.code, "message": str(exc)}
+                failed = {**shell, "status": "failed", "error": error, "output": [], "output_text": ""}
+                self.write_sse({"type": "error", "code": exc.code, "message": str(exc), "param": None}, "error")
+                self.write_sse({"type": "response.failed", "response": failed}, "response.failed")
+                self.close_connection = True; return
             output = generation["text"]; items: list[dict[str, Any]] = []
             if plan["enabled"]:
-                parsed = parse_client_tool_output(output, plan["tools"], plan["choice"])
                 if parsed["type"] == "tool_calls":
-                    for index, call in enumerate(assign_call_ids(parsed["calls"], "fc")):
-                        item = {"id": call["id"], "type": "function_call", "status": "completed", "call_id": call["id"], "name": call["name"], "arguments": json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":"))}
-                        items.append(item); self.write_sse({"type": "response.output_item.added", "output_index": index, "item": item}, "response.output_item.added"); self.write_sse({"type": "response.output_item.done", "output_index": index, "item": item}, "response.output_item.done")
-                    output = ""
+                    output = parsed["commentary"]; offset = 0
+                    if output:
+                        item = {"id": item_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}
+                        self.write_sse({"type": "response.output_item.added", "output_index": 0, "item": item}, "response.output_item.added")
+                        self.write_sse({"type": "response.content_part.added", "item_id": item_id, "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}, "response.content_part.added")
+                        self.write_sse({"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": output}, "response.output_text.delta")
+                        self.write_sse({"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": output}, "response.output_text.done")
+                        item["status"] = "completed"; item["content"] = [{"type": "output_text", "text": output, "annotations": []}]; items.append(item)
+                        self.write_sse({"type": "response.content_part.done", "item_id": item_id, "output_index": 0, "content_index": 0, "part": item["content"][0]}, "response.content_part.done")
+                        self.write_sse({"type": "response.output_item.done", "output_index": 0, "item": item}, "response.output_item.done"); offset = 1
+                    for index, call in enumerate(assign_call_ids(parsed["calls"], "fc"), start=offset):
+                        arguments = json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":"))
+                        item = {"id": call["id"], "type": "function_call", "status": "in_progress", "call_id": call["id"], "name": call["name"], "arguments": ""}
+                        self.write_sse({"type": "response.output_item.added", "output_index": index, "item": item}, "response.output_item.added")
+                        self.write_sse({"type": "response.function_call_arguments.delta", "item_id": call["id"], "output_index": index, "content_index": 0, "delta": arguments}, "response.function_call_arguments.delta")
+                        self.write_sse({"type": "response.function_call_arguments.done", "item_id": call["id"], "output_index": index, "name": call["name"], "arguments": arguments}, "response.function_call_arguments.done")
+                        item["status"] = "completed"; item["arguments"] = arguments; items.append(item)
+                        self.write_sse({"type": "response.output_item.done", "output_index": index, "item": item}, "response.output_item.done")
                 else: output = parsed["content"]
-            if output and not started:
-                item = {"id": item_id, "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": output, "annotations": []}]}; items = [item]
+            if output and not started and (not plan["enabled"] or parsed["type"] == "final"):
+                item = {"id": item_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}
                 self.write_sse({"type": "response.output_item.added", "output_index": 0, "item": item}, "response.output_item.added")
+                self.write_sse({"type": "response.content_part.added", "item_id": item_id, "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}, "response.content_part.added")
+                self.write_sse({"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": output}, "response.output_text.delta")
+                self.write_sse({"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": output}, "response.output_text.done")
+                item["status"] = "completed"; item["content"] = [{"type": "output_text", "text": output, "annotations": []}]; items = [item]
+                self.write_sse({"type": "response.content_part.done", "item_id": item_id, "output_index": 0, "content_index": 0, "part": item["content"][0]}, "response.content_part.done")
+                self.write_sse({"type": "response.output_item.done", "output_index": 0, "item": item}, "response.output_item.done")
             elif started:
                 item = {"id": item_id, "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": output, "annotations": []}]}; items = [item]
                 self.write_sse({"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": output}, "response.output_text.done")
@@ -1965,10 +2159,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         generation = consume_generation(self.app, model, plan["prompt"], conv, plan["profile"], event_mode)
         output = generation["text"]; items: list[dict[str, Any]]
         if plan["enabled"]:
-            parsed = parse_client_tool_output(output, plan["tools"], plan["choice"])
+            generation, parsed = resolve_client_tool_output(self.app, model, plan, conv, generation)
             if parsed["type"] == "tool_calls":
-                calls = assign_call_ids(parsed["calls"], "fc"); output = ""
-                items = [{"id": call["id"], "type": "function_call", "status": "completed", "call_id": call["id"], "name": call["name"], "arguments": json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":"))} for call in calls]
+                calls = assign_call_ids(parsed["calls"], "fc"); output = parsed["commentary"]
+                items = ([{"id": "msg_" + uid(), "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": output, "annotations": []}]}] if output else [])
+                items += [{"id": call["id"], "type": "function_call", "status": "completed", "call_id": call["id"], "name": call["name"], "arguments": json.dumps(call["arguments"], ensure_ascii=False, separators=(",", ":"))} for call in calls]
             else: output = parsed["content"]; items = [{"id": "msg_" + uid(), "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": output, "annotations": []}]}]
         else: items = [{"id": "msg_" + uid(), "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": output, "annotations": []}]}]
         usage = responses_usage(base_prompt, output, generation.get("usage"))

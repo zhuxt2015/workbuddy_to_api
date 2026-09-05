@@ -252,6 +252,8 @@ Copy-Item .env.example .env
 | `WORKBUDDY_DISABLE_TOOLS` | `0` | 设为 `1` 时关闭内置工具 |
 | `WORKBUDDY_TOOLS` | `default` | WorkBuddy 工具预设 |
 | `WORKBUDDY_MAX_TURNS` | `8` | 最大 agent 回合数 |
+| `WORKBUDDY_REQUEST_TIMEOUT_MS` | `900000` | 上游请求与 SSE 读取超时（毫秒） |
+| `WORKBUDDY_SSE_HEARTBEAT_MS` | `15000` | 流式响应心跳间隔（毫秒） |
 | `WORKBUDDY_MCP_CONFIG` | 自动发现 | MCP JSON 或配置文件路径 |
 | `WORKBUDDY_EVENT_MAX_BYTES` | `65536` | 单个事件字段大小上限 |
 | `WORKBUDDY_ACCOUNT_SESSION_PATH` | 自动发现 | WorkBuddy 本地会话文件路径，仅在内存中读取 |
